@@ -7224,6 +7224,7 @@ class DecisionType:
     GRANITE_SWITCH = "granite-switch"  # same as openjev, run by the decision aLoRA of granite switch
     H2O_LIGHTNING = "h2o-lightning"  # same as openjev, labels read after an answer prefill
     MINICPM_OCR_JEV = "openbmb-minicpm-ocr-jev"  # class scores of a value head read at the last token, one fixed task
+    GLIDE_ENCODER = "fastino-glide-encoder"  # ModernBERT encoder + 255-way cls_out readout at the last non-[SEP] token
 
 
 class VisionProjectorType:

@@ -260,7 +260,7 @@ struct server_task {
             case SERVER_TASK_TYPE_RERANK:
                 return true;
             case SERVER_TASK_TYPE_DECISION:
-                return !decision.markers.empty() || !decision.order.empty() || decision.pooled;
+                return !decision.markers.empty() || !decision.order.empty() || decision.pooled || decision.pointer >= 0;
             default:
                 return false;
         }

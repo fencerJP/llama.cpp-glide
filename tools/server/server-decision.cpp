@@ -44,16 +44,20 @@ void server_decision_context::init(const llama_model * model) {
         return;
     }
 
-    const std::string prefix    = decision_meta_str(model, "general.architecture") + ".decision.";
-    const std::string type_name = decision_meta_str(model, prefix + "type");
+    const std::string arch      = decision_meta_str(model, "general.architecture");
+    const std::string prefix    = arch + ".decision.";
+    std::string       type_name = decision_meta_str(model, prefix + "type");
 
     vocab = llama_model_get_vocab(model);
 
     const char * tmpl_src = llama_model_chat_template(model, "systemone");
     if (tmpl_src == nullptr) {
-        throw std::runtime_error("decision model has no \"systemone\" template");
+        if (model_type != COMMON_DECISION_TYPE_GLIDE_ENCODER) {
+            throw std::runtime_error("decision model has no \"systemone\" template");
+        }
+    } else {
+        tmpl = std::make_shared<const common_chat_template>(tmpl_src, "", "");
     }
-    tmpl = std::make_shared<const common_chat_template>(tmpl_src, "", "");
 
     const std::string prefix_temp = prefix + "temperature.";
     for (int32_t i = 0; i < llama_model_meta_count(model); i++) {
@@ -202,6 +206,43 @@ void server_decision_context::init(const llama_model * model) {
         }
         n_options_max = n_classes;
         choice_sorted = true;
+    } else if (model_type == COMMON_DECISION_TYPE_GLIDE_ENCODER) {
+        for (uint32_t i = 0; i < llama_model_n_cls_out(model); i++) {
+            const char * lbl = llama_model_cls_label(model, i);
+            if (lbl == nullptr) {
+                lbl = llama_model_decision_label(model, i);
+            }
+            if (lbl == nullptr) {
+                break;
+            }
+            label_texts.emplace_back(lbl);
+        }
+        if (label_texts.empty()) {
+            throw std::runtime_error("glide-encoder model has no output labels");
+        }
+        n_options_max   = std::min<size_t>(label_texts.size(), 255);
+        noul_true_first = true;
+        if (type_name.empty()) {
+            type_name = "fastino-glide-encoder";
+        }
+        const std::string max_len_str = decision_meta_str(model, prefix + "max_len");
+        const std::string ctx_len_str = decision_meta_str(model, arch + ".context_length");
+        if (!max_len_str.empty()) {
+            glide_max_len = std::strtoul(max_len_str.c_str(), nullptr, 10);
+        } else if (!ctx_len_str.empty()) {
+            glide_max_len = std::strtoul(ctx_len_str.c_str(), nullptr, 10);
+        }
+        const std::string trunc_str = decision_meta_str(model, prefix + "trunc_head");
+        if (!trunc_str.empty()) {
+            glide_trunc_head = std::strtoul(trunc_str.c_str(), nullptr, 10);
+        }
+        const std::string pool_str = decision_meta_str(model, arch + ".pooling_type");
+        if (!pool_str.empty()) {
+            const int p = std::atoi(pool_str.c_str());
+            if (p == LLAMA_POOLING_TYPE_CLS || p == LLAMA_POOLING_TYPE_LAST) {
+                glide_pooling = p;
+            }
+        }
     } else {
         throw std::runtime_error("unsupported decision model type: " + type_name);
     }
@@ -310,18 +351,39 @@ std::vector<server_decision_question> server_decision_context::parse_questions(c
             }
         } else if (type_name == "score") {
             question.type = SERVER_DECISION_QUESTION_SCORE;
-            // h2o-lightning: from 1 level, the maximum is n_options_max
-            if (is_h2o && (!criteria.is_array() || criteria.empty())) {
-                throw err("\"criteria\" must be a non-empty array");
-            }
-            if (!is_h2o && (!criteria.is_array() || criteria.size() < 2 || criteria.size() > 10)) {
-                throw err("\"criteria\" must be an array of 2 to 10 levels");
-            }
-            for (size_t i = 0; i < criteria.size(); i++) {
-                if (strict_payload && !decision_is_payload(criteria.at(i))) {
-                    throw err("level descriptions must be text, an object or an array");
+            if (type == COMMON_DECISION_TYPE_GLIDE_ENCODER && criteria.is_object()) {
+                std::vector<std::pair<double, json>> levels;
+                for (const auto & [k, v] : criteria.items()) {
+                    char * end = nullptr;
+                    const double num = std::strtod(k.c_str(), &end);
+                    if (k.empty() || end == nullptr || *end != '\0') {
+                        throw err("score criteria keys must be numeric levels");
+                    }
+                    levels.emplace_back(num, v);
                 }
-                question.options.push_back({std::to_string(i), criteria.at(i)});
+                if (levels.empty()) {
+                    throw err("a score question needs at least one level");
+                }
+                std::stable_sort(levels.begin(), levels.end(), [](const auto & a, const auto & b) {
+                    return a.first < b.first;
+                });
+                for (size_t i = 0; i < levels.size(); i++) {
+                    question.options.push_back({std::to_string(i), levels[i].second});
+                }
+            } else {
+                // h2o-lightning: from 1 level, the maximum is n_options_max
+                if (is_h2o && (!criteria.is_array() || criteria.empty())) {
+                    throw err("\"criteria\" must be a non-empty array");
+                }
+                if (!is_h2o && (!criteria.is_array() || criteria.size() < 2 || criteria.size() > 10)) {
+                    throw err("\"criteria\" must be an array of 2 to 10 levels");
+                }
+                for (size_t i = 0; i < criteria.size(); i++) {
+                    if (strict_payload && !decision_is_payload(criteria.at(i))) {
+                        throw err("level descriptions must be text, an object or an array");
+                    }
+                    question.options.push_back({std::to_string(i), criteria.at(i)});
+                }
             }
         } else if (type_name == "noul") {
             question.type = SERVER_DECISION_QUESTION_NOUL;
@@ -1203,6 +1265,98 @@ void server_decision_context::fill_task(
     }
     if (type == COMMON_DECISION_TYPE_LFM2_D1_OMNI) {
         fill_task_d1omni(state, questions, question, variant, files, mctx, init_opt, task);
+        return;
+    }
+
+    if (type == COMMON_DECISION_TYPE_GLIDE_ENCODER) {
+        if (!files.empty()) {
+            throw std::invalid_argument("images are not supported by this deployment");
+        }
+        auto as_text = [](const json & x) -> std::string {
+            if (x.is_string()) {
+                return x.get<std::string>();
+            }
+            if (x.is_object()) {
+                std::string out;
+                for (const auto & [k, v] : x.items()) {
+                    if (!out.empty()) {
+                        out.push_back('\n');
+                    }
+                    out += k + ": " + (v.is_string() ? v.get<std::string>() : v.dump());
+                }
+                return out;
+            }
+            return x.is_null() ? "" : x.dump();
+        };
+
+        const std::string state_text = state.is_string() ? state.get<std::string>() : state.dump();
+        const std::string instr_text = as_text(question.instructions);
+
+        std::string options_text;
+        for (size_t i = 0; i < question.options.size(); i++) {
+            const auto & opt = question.options[i];
+            const std::string & code = label_texts[i];
+            std::string desc;
+            if (question.type == SERVER_DECISION_QUESTION_NOUL) {
+                if (opt.description.is_string() && !opt.description.get<std::string>().empty()) {
+                    desc = opt.description.get<std::string>();
+                } else if (opt.description.is_null() || (opt.description.is_string() && opt.description.get<std::string>().empty())) {
+                    desc = opt.key == "true" ? "Yes" : "No";
+                } else {
+                    desc = opt.description.dump();
+                }
+            } else {
+                if (opt.description.is_string() && !opt.description.get<std::string>().empty()) {
+                    desc = opt.description.get<std::string>();
+                } else if (opt.description.is_null() || (opt.description.is_string() && opt.description.get<std::string>().empty())) {
+                    desc = opt.key;
+                } else {
+                    desc = opt.description.dump();
+                }
+            }
+            if (!options_text.empty()) {
+                options_text.push_back('\n');
+            }
+            if (desc == opt.key) {
+                options_text += "(" + code + ") " + opt.key;
+            } else {
+                options_text += "(" + code + ") " + opt.key + ": " + desc;
+            }
+        }
+
+        std::string body = "Context:\n" + state_text + "\n\nQuestion: " + instr_text + "\n\nOptions:\n" + options_text;
+        while (!body.empty() && (body.back() == ' ' || body.back() == '\t' || body.back() == '\n' || body.back() == '\r')) {
+            body.pop_back();
+        }
+        body += "\n\nThink it through briefly, then answer with the option letter only.";
+
+        const std::string prompt =
+            "<|im_start|>user\n" + body +
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nAnswer: (";
+
+        llama_tokens tokens = common_tokenize(vocab, prompt, false, false);
+        const size_t max_body = glide_max_len > 2 ? glide_max_len - 2 : 0;
+        if (max_body > 0 && tokens.size() > max_body) {
+            const size_t head = std::min(glide_trunc_head, max_body);
+            const size_t tail = max_body - head;
+            llama_tokens truncated;
+            truncated.reserve(max_body);
+            truncated.insert(truncated.end(), tokens.begin(), tokens.begin() + head);
+            truncated.insert(truncated.end(), tokens.end() - tail, tokens.end());
+            tokens = std::move(truncated);
+        }
+
+        const llama_token cls_id = llama_vocab_bos(vocab);
+        const llama_token sep_id = llama_vocab_sep(vocab) != LLAMA_TOKEN_NULL ? llama_vocab_sep(vocab) : llama_vocab_eos(vocab);
+        if (cls_id == LLAMA_TOKEN_NULL || sep_id == LLAMA_TOKEN_NULL) {
+            throw std::runtime_error("glide-encoder model has no CLS/SEP token");
+        }
+        tokens.insert(tokens.begin(), cls_id);
+        tokens.push_back(sep_id);
+
+        task.decision.pointer  = glide_pooling == LLAMA_POOLING_TYPE_CLS ? 0 : (int32_t) tokens.size() - 2;
+        task.decision.n_scores = (int32_t) n_outputs(question);
+        task.tokens = server_tokens(tokens, false);
         return;
     }
 

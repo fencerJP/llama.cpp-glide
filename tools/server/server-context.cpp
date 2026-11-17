@@ -2489,36 +2489,47 @@ private:
                 return i >= 0 && i < (int32_t) idx.size() ? llama_get_embeddings_ith(slot.ctx_tgt, idx[i]) : nullptr;
             };
 
-            // joint head (decision model): the scores are the first rows
-            for (int32_t i = 0; i < decision.n_scores; i++) {
-                const float * embd = i < (int32_t) idx.size() ? llama_get_embeddings_ith(slot.ctx_tgt, idx[i]) : nullptr;
-                if (embd == nullptr) {
+            if (decision.markers.empty() && decision.pointer >= 0) {
+                const float * embd_q = get_embd(decision.pointer);
+                if (embd_q == nullptr) {
                     send_error(slot, "failed to get embeddings", ERROR_TYPE_SERVER);
                     return;
                 }
-                res->scores.push_back(embd[0]);
-            }
+                const int32_t n_embd_out = llama_model_n_embd_out(model_tgt);
+                const int32_t n_scores = decision.n_scores > 0 ? std::min(decision.n_scores, n_embd_out) : n_embd_out;
+                res->scores.assign(embd_q, embd_q + n_scores);
+            } else {
+                // joint head (decision model): the scores are the first rows
+                for (int32_t i = 0; i < decision.n_scores; i++) {
+                    const float * embd = i < (int32_t) idx.size() ? llama_get_embeddings_ith(slot.ctx_tgt, idx[i]) : nullptr;
+                    if (embd == nullptr) {
+                        send_error(slot, "failed to get embeddings", ERROR_TYPE_SERVER);
+                        return;
+                    }
+                    res->scores.push_back(embd[0]);
+                }
 
-            const int32_t n_embd_out = llama_model_n_embd_out(model_tgt);
-            const int32_t n_pointer  = n_embd_out / 2;
-            const float * embd_q = decision.pointer >= 0 ? get_embd(decision.pointer) : nullptr;
-            GGML_ASSERT(decision.column >= 0 && decision.column < n_embd_out);
+                const int32_t n_embd_out = llama_model_n_embd_out(model_tgt);
+                const int32_t n_pointer  = n_embd_out / 2;
+                const float * embd_q = decision.pointer >= 0 ? get_embd(decision.pointer) : nullptr;
+                GGML_ASSERT(decision.column >= 0 && decision.column < n_embd_out);
 
-            for (const int32_t marker : decision.markers) {
-                const float * embd = get_embd(marker);
-                if (embd == nullptr || (decision.pointer >= 0 && embd_q == nullptr)) {
-                    send_error(slot, "failed to get embeddings, the question and its options must fit in one batch", ERROR_TYPE_SERVER);
-                    return;
+                for (const int32_t marker : decision.markers) {
+                    const float * embd = get_embd(marker);
+                    if (embd == nullptr || (decision.pointer >= 0 && embd_q == nullptr)) {
+                        send_error(slot, "failed to get embeddings, the question and its options must fit in one batch", ERROR_TYPE_SERVER);
+                        return;
+                    }
+                    if (decision.pointer < 0) {
+                        res->scores.push_back(embd[decision.column]);
+                        continue;
+                    }
+                    float dot = 0.0f;
+                    for (int32_t i = 0; i < n_pointer; i++) {
+                        dot += embd_q[i] * embd[n_pointer + i];
+                    }
+                    res->scores.push_back(dot / sqrtf((float) n_pointer));
                 }
-                if (decision.pointer < 0) {
-                    res->scores.push_back(embd[decision.column]);
-                    continue;
-                }
-                float dot = 0.0f;
-                for (int32_t i = 0; i < n_pointer; i++) {
-                    dot += embd_q[i] * embd[n_pointer + i];
-                }
-                res->scores.push_back(dot / sqrtf((float) n_pointer));
             }
         }
 
